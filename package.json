@@ -1,0 +1,43 @@
+{
+  "name": "inqualan",
+  "version": "1.1.0",
+  "description": "Ứng dụng in ấn mạng LAN tích hợp Máy in ảo (Electron & Node.js)",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win",
+    "dist:win:publish": "electron-builder --win --publish always"
+  },
+  "dependencies": {
+    "electron-updater": "^6.6.2",
+    "pdf-to-printer": "^3.0.0",
+    "sudo-prompt": "^9.2.1"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.lanprint.app",
+    "productName": "LAN Print",
+    "win": {
+      "target": "nsis",
+      "requestedExecutionLevel": "requireAdministrator",
+      "artifactName": "LAN-Print-${version}-x64.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "trongdqtgg",
+        "repo": "trinhduyet_release",
+        "releaseType": "release"
+      }
+    ]
+  }
+}

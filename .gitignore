@@ -1,0 +1,5 @@
+node_modules/
+release/
+dist/
+*.log
+build-and-publish.bat

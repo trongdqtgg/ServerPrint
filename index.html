@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Cấu hình Máy in ảo LAN</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 30px; background: #f4f4f9; color: #1f2937; }
+        .card { background: white; padding: 24px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); max-width: 540px; margin: auto; }
+        h2 { margin-top: 0; }
+        .mode-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 18px 0; }
+        .mode-btn { background: #e5e7eb; color: #111827; border: 2px solid transparent; padding: 16px 10px; }
+        .mode-btn:hover { background: #dbeafe; }
+        .mode-btn.active { background: #e0f2fe; border-color: #0284c7; color: #075985; }
+        .panel { display: none; padding-top: 8px; }
+        .panel.active { display: block; }
+        input { width: 100%; padding: 10px; margin: 10px 0 20px 0; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; width: 100%; font-size: 16px; }
+        button:hover { background: #0056b3; }
+        .ip-list { background: #ecfdf5; border: 1px solid #6ee7b7; border-radius: 8px; padding: 14px; }
+        .ip-item { font-size: 20px; font-weight: bold; color: #047857; padding: 5px 0; user-select: all; }
+        .server-action { margin-top: 12px; background: #dc2626; }
+        .server-action:hover { background: #b91c1c; }
+        .update-box { margin-top: 18px; padding: 12px; border: 1px solid #d1d5db; border-radius: 8px; background: #f9fafb; }
+        .update-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+        .update-row button { width: auto; padding: 7px 12px; font-size: 13px; }
+        .progress { display: none; height: 7px; margin-top: 10px; background: #e5e7eb; border-radius: 99px; overflow: hidden; }
+        .progress.active { display: block; }
+        .progress-bar { width: 0; height: 100%; background: #0284c7; transition: width .2s; }
+        .muted { color: #6b7280; font-size: 13px; }
+        #log { margin-top: 20px; background: #000; color: #0f0; padding: 10px; border-radius: 4px; height: 150px; overflow-y: auto; font-family: monospace; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>LAN Print</h2>
+        <p>Chọn vai trò của máy tính này:</p>
+
+        <div class="mode-grid">
+            <button class="mode-btn" id="clientModeBtn">💻 Máy Client</button>
+            <button class="mode-btn" id="serverModeBtn">🖨️ Máy Server</button>
+        </div>
+
+        <section id="clientPanel" class="panel">
+            <h3>Cài máy in ảo trên Client</h3>
+            <label for="serverIp">Nhập IP của máy Server:</label>
+            <input type="text" id="serverIp" placeholder="Ví dụ: 192.168.1.100">
+            <button id="installBtn">Tự động cài máy in ảo vào Windows</button>
+            <p class="muted">Ứng dụng sẽ yêu cầu quyền Administrator. Hãy chọn Yes trong hộp thoại UAC.</p>
+        </section>
+
+        <section id="serverPanel" class="panel">
+            <h3>Thông tin máy Server</h3>
+            <p>Nhập một trong các IP dưới đây vào ứng dụng trên máy Client:</p>
+            <div id="ipList" class="ip-list"><span class="muted">Đang lấy địa chỉ IP...</span></div>
+            <p class="muted">Server tự lắng nghe kết nối in trên cổng 9100.</p>
+            <button id="reclaimPortBtn" class="server-action">Giải phóng và mở lại cổng 9100</button>
+        </section>
+
+        <div class="update-box">
+            <div class="update-row">
+                <span id="updateStatus">Phiên bản: đang xác định...</span>
+                <button id="checkUpdateBtn">Kiểm tra cập nhật</button>
+            </div>
+            <div id="updateProgress" class="progress"><div id="updateProgressBar" class="progress-bar"></div></div>
+        </div>
+
+        <h3>Nhật ký hoạt động:</h3>
+        <div id="log"></div>
+    </div>
+
+    <script>
+        const { ipcRenderer } = require('electron');
+
+        const clientModeBtn = document.getElementById('clientModeBtn');
+        const serverModeBtn = document.getElementById('serverModeBtn');
+        const clientPanel = document.getElementById('clientPanel');
+        const serverPanel = document.getElementById('serverPanel');
+
+        async function selectMode(mode) {
+            const isClient = mode === 'client';
+            clientModeBtn.classList.toggle('active', isClient);
+            serverModeBtn.classList.toggle('active', !isClient);
+            clientPanel.classList.toggle('active', isClient);
+            serverPanel.classList.toggle('active', !isClient);
+            ipcRenderer.send('set-app-mode', mode);
+
+            if (!isClient) {
+                const addresses = await ipcRenderer.invoke('get-local-ip-addresses');
+                const ipList = document.getElementById('ipList');
+                if (!addresses.length) {
+                    ipList.innerHTML = '<span class="muted">Không tìm thấy IPv4 LAN. Hãy kiểm tra Wi-Fi hoặc dây mạng.</span>';
+                    return;
+                }
+                ipList.innerHTML = addresses.map(item =>
+                    `<div class="ip-item">${item.address}</div><div class="muted">${item.interfaceName}</div>`
+                ).join('');
+            }
+        }
+
+        clientModeBtn.addEventListener('click', () => selectMode('client'));
+        serverModeBtn.addEventListener('click', () => selectMode('server'));
+        document.getElementById('reclaimPortBtn').addEventListener('click', () => {
+            ipcRenderer.send('reclaim-print-port');
+        });
+
+        ipcRenderer.invoke('get-app-version').then(version => {
+            document.getElementById('updateStatus').textContent = `Phiên bản hiện tại: v${version}`;
+        });
+
+        document.getElementById('checkUpdateBtn').addEventListener('click', () => {
+            ipcRenderer.send('check-for-updates');
+        });
+
+        ipcRenderer.on('update-status', (event, data) => {
+            document.getElementById('updateStatus').textContent = data.text;
+            const progress = document.getElementById('updateProgress');
+            const bar = document.getElementById('updateProgressBar');
+            if (data.status === 'downloading') {
+                progress.classList.add('active');
+                bar.style.width = `${data.percent || 0}%`;
+            } else {
+                progress.classList.remove('active');
+                bar.style.width = '0%';
+            }
+        });
+
+        document.getElementById('installBtn').addEventListener('click', () => {
+            const ip = document.getElementById('serverIp').value.trim();
+            if (!ip) {
+                alert('Vui lòng nhập địa chỉ IP của Server!');
+                return;
+            }
+            // Gửi yêu cầu cấu hình xuống main process
+            ipcRenderer.send('install-virtual-printer', ip);
+        });
+
+        ipcRenderer.on('log-message', (event, text) => {
+            const logDiv = document.getElementById('log');
+            logDiv.innerHTML += text + '<br>';
+            logDiv.scrollTop = logDiv.scrollHeight;
+        });
+    </script>
+</body>
+</html>
