@@ -1,12 +1,13 @@
 {
   "name": "inqualan",
-  "version": "1.9.1",
+  "version": "2.0.1",
   "description": "Ứng dụng in ấn mạng LAN tích hợp Máy in ảo (Electron & Node.js)",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dist:win": "electron-builder --win",
-    "dist:win:publish": "electron-builder --win --publish always"
+    "dist:win": "electron-builder --win --publish never",
+    "dist:win:publish": "electron-builder --win --publish never && node scripts/publish-github.js",
+    "publish:github": "node scripts/publish-github.js"
   },
   "dependencies": {
     "electron-updater": "^6.6.2",
@@ -23,6 +24,7 @@
     "files": [
       "**/*",
       "!scripts/**",
+      "!build/**",
       "!build-and-publish.bat",
       "!virtual-print-output/**"
     ],
@@ -32,13 +34,17 @@
     "win": {
       "target": "nsis",
       "requestedExecutionLevel": "requireAdministrator",
-      "artifactName": "LAN-Print-${version}-x64.${ext}"
+      "artifactName": "LAN-Print-${version}-x64.${ext}",
+      "icon": "build/icon.ico"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "createStartMenuShortcut": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico"
     },
     "publish": [
       {

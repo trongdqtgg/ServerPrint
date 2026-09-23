@@ -6,7 +6,14 @@
     <style>
         body { font-family: Arial, sans-serif; margin: 30px; background: #f4f4f9; color: #1f2937; }
         .card { background: white; padding: 24px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); max-width: 540px; margin: auto; }
-        h2 { margin-top: 0; }
+        h2 { margin: 0; }
+        .app-header { display: flex; align-items: center; gap: 14px; margin-bottom: 6px; }
+        .app-header img { width: 52px; height: 52px; flex: none; }
+        .app-header .sub { color: #0066b3; font-size: 13px; margin-top: 2px; }
+        .window-actions { margin-top: 14px; }
+        .window-actions button { font-size: 14px; padding: 9px; }
+        .btn-secondary { background: #e5e7eb; color: #111827; }
+        .btn-secondary:hover { background: #d1d5db; }
         .mode-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 18px 0; }
         .mode-btn { background: #e5e7eb; color: #111827; border: 2px solid transparent; padding: 16px 10px; }
         .mode-btn:hover { background: #dbeafe; }
@@ -32,7 +39,13 @@
 </head>
 <body>
     <div class="card">
-        <h2>LAN Print</h2>
+        <div class="app-header">
+            <img src="assets/logo.png" alt="Logo">
+            <div>
+                <h2>LAN Print</h2>
+                <div class="sub">In ấn qua mạng LAN</div>
+            </div>
+        </div>
         <p>Chọn vai trò của máy tính này:</p>
 
         <div class="mode-grid">
@@ -61,8 +74,14 @@
                 <span id="updateStatus">Phiên bản: đang xác định...</span>
                 <button id="checkUpdateBtn">Kiểm tra cập nhật</button>
             </div>
+            <div class="muted" style="margin-top:6px">Tự động kiểm tra mỗi 4 giờ. Có bản mới sẽ tự tải, cài đặt ngầm và khởi động lại ứng dụng.</div>
             <div id="updateProgress" class="progress"><div id="updateProgressBar" class="progress-bar"></div></div>
         </div>
+
+        <div class="window-actions">
+            <button id="hideToTrayBtn" class="btn-secondary">Thu xuống khay hệ thống</button>
+        </div>
+        <p class="muted">Ứng dụng tự khởi động cùng Windows và chạy ngầm dưới khay hệ thống (góc phải thanh Taskbar). Nhấn X chỉ thu nhỏ xuống khay, máy Server vẫn tiếp tục nhận lệnh in.</p>
 
         <h3>Nhật ký hoạt động:</h3>
         <div id="log"></div>
@@ -103,6 +122,22 @@
             ipcRenderer.send('reclaim-print-port');
         });
 
+        // ===== Khôi phục cấu hình đã lưu lần trước =====
+        ipcRenderer.invoke('get-settings').then(settings => {
+            if (settings.serverIp) document.getElementById('serverIp').value = settings.serverIp;
+
+            if (settings.mode === 'server' || settings.mode === 'client') {
+                const log = settings.launchedAtStartup ? 'Tự khởi động cùng Windows' : 'Mở lại ứng dụng';
+                ipcRenderer.send('log-from-renderer', `${log} - khôi phục chế độ ${settings.mode === 'server' ? 'Server' : 'Client'}.`);
+                selectMode(settings.mode);
+                if (settings.mode === 'client' && settings.serverIp) {
+                    ipcRenderer.send('log-from-renderer', `Máy in ảo đang trỏ tới Server: ${settings.serverIp}:9100`);
+                }
+            }
+        });
+
+        document.getElementById('hideToTrayBtn').addEventListener('click', () => ipcRenderer.send('hide-to-tray'));
+
         ipcRenderer.invoke('get-app-version').then(version => {
             document.getElementById('updateStatus').textContent = `Phiên bản hiện tại: v${version}`;
         });
@@ -115,6 +150,7 @@
             document.getElementById('updateStatus').textContent = data.text;
             const progress = document.getElementById('updateProgress');
             const bar = document.getElementById('updateProgressBar');
+            document.getElementById('checkUpdateBtn').disabled = ['checking', 'downloading', 'installing'].includes(data.status);
             if (data.status === 'downloading') {
                 progress.classList.add('active');
                 bar.style.width = `${data.percent || 0}%`;

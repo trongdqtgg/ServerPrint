@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
@@ -16,7 +16,15 @@ const VIRTUAL_PORT_NAME = 'LAN_Virtual_Printer_Port';
 const TCP_PRINT_PORT = 9100;
 const FIREWALL_RULE_NAME = 'LAN Print TCP 9100';
 
+const AUTOSTART_TASK_NAME = 'LAN Print Autostart';
+const AUTOSTART_ARG = '--autostart';
+const LAUNCHED_AT_STARTUP = process.argv.includes(AUTOSTART_ARG);
+
 let mainWindow;
+let tray = null;
+let trayHintShown = false;
+let activePrintConnections = 0;
+let updateCheckTimer = null;
 let tcpPrinterServer = null;
 let elevationRequested = false;
 let autoUpdaterInitialized = false;
@@ -34,6 +42,166 @@ function getVirtualPrintDir() {
     }
     fs.mkdirSync(VIRTUAL_PRINT_DIR, { recursive: true });
     return VIRTUAL_PRINT_DIR;
+}
+
+// ================= LƯU / ĐỌC CẤU HÌNH (chế độ, IP Server, tự khởi động) =================
+// Lưu ở %APPDATA%\LAN Print\settings.json - không bị mất khi cập nhật phiên bản.
+const DEFAULT_SETTINGS = { mode: null, serverIp: '' };
+
+function getSettingsPath() {
+    return path.join(app.getPath('userData'), 'settings.json');
+}
+
+function loadSettings() {
+    try {
+        const raw = fs.readFileSync(getSettingsPath(), 'utf8');
+        return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    } catch (e) {
+        return { ...DEFAULT_SETTINGS };
+    }
+}
+
+function saveSettings(patch) {
+    const next = { ...loadSettings(), ...patch };
+    try {
+        fs.mkdirSync(app.getPath('userData'), { recursive: true });
+        const file = getSettingsPath();
+        const tmp = `${file}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf8');
+        fs.renameSync(tmp, file);
+    } catch (err) {
+        sendLog(`⚠️ Không lưu được cấu hình: ${err.message}`);
+    }
+    return next;
+}
+
+// ================= KHỞI ĐỘNG CÙNG WINDOWS (Task Scheduler) =================
+// Ứng dụng bắt buộc chạy quyền Administrator (requireAdministrator). Windows
+// CHẶN mọi chương trình cần quyền admin đặt trong Startup folder hoặc khoá
+// Run của Registry (app.setLoginItemSettings) - nên phải dùng Task Scheduler
+// với "Run with highest privileges": chạy thẳng quyền admin, không hiện UAC.
+// Tạo task bằng file XML để tắt được các mặc định gây lỗi của schtasks:
+//   - Không chạy khi dùng pin (laptop)      -> DisallowStartIfOnBatteries=false
+//   - Tự tắt ứng dụng sau 72 giờ chạy       -> ExecutionTimeLimit=PT0S
+function xmlEscape(value) {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+function getCurrentWindowsUser() {
+    const user = process.env.USERNAME || os.userInfo().username;
+    const domain = process.env.USERDOMAIN;
+    return domain ? `${domain}\\${user}` : user;
+}
+
+function buildAutostartTaskXml() {
+    const user = xmlEscape(getCurrentWindowsUser());
+    const command = xmlEscape(process.execPath);
+    // Bản dev (npm start) phải truyền thêm đường dẫn app cho electron.exe.
+    const args = app.isPackaged
+        ? AUTOSTART_ARG
+        : `"${app.getAppPath()}" ${AUTOSTART_ARG}`;
+    const workDir = xmlEscape(path.dirname(process.execPath));
+
+    return `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Tu dong mo LAN Print khi dang nhap Windows</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>${user}</UserId>
+      <Delay>PT15S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>${user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>${command}</Command>
+      <Arguments>${xmlEscape(args)}</Arguments>
+      <WorkingDirectory>${workDir}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>`;
+}
+
+async function isAutostartTaskInstalled() {
+    if (process.platform !== 'win32') return false;
+    const res = await runCmd(`schtasks /Query /TN "${AUTOSTART_TASK_NAME}"`);
+    return res.ok;
+}
+
+async function enableAutostart() {
+    if (process.platform !== 'win32') return true;
+    const xmlPath = path.join(app.getPath('userData'), 'autostart-task.xml');
+    try {
+        fs.mkdirSync(app.getPath('userData'), { recursive: true });
+        // schtasks /XML đọc chuẩn nhất với UTF-16 LE có BOM.
+        fs.writeFileSync(xmlPath, Buffer.concat([
+            Buffer.from([0xFF, 0xFE]),
+            Buffer.from(buildAutostartTaskXml(), 'utf16le')
+        ]));
+    } catch (err) {
+        sendLog(`❌ Không ghi được file cấu hình Task Scheduler: ${err.message}`);
+        return false;
+    }
+
+    const res = await runCmd(`schtasks /Create /F /TN "${AUTOSTART_TASK_NAME}" /XML "${xmlPath}"`);
+    try { fs.unlinkSync(xmlPath); } catch (e) { /* bỏ qua */ }
+
+    if (!res.ok || !(await isAutostartTaskInstalled())) {
+        sendLog(`❌ Không bật được khởi động cùng Windows: ${res.stderr || res.stdout}`);
+        return false;
+    }
+    return true;
+}
+
+async function disableAutostart() {
+    if (process.platform !== 'win32') return true;
+    if (!(await isAutostartTaskInstalled())) return true;
+    const res = await runCmd(`schtasks /Delete /F /TN "${AUTOSTART_TASK_NAME}"`);
+    if (!res.ok) {
+        sendLog(`❌ Không tắt được khởi động cùng Windows: ${res.stderr || res.stdout}`);
+        return false;
+    }
+    return true;
+}
+
+// Khởi động cùng Windows là MẶC ĐỊNH BẮT BUỘC (không cho tắt trên giao diện).
+// Mỗi lần mở app đều tạo lại task: tự khôi phục nếu bị xoá, và cập nhật đường
+// dẫn .exe nếu người dùng cài lại vào thư mục khác.
+async function syncAutostartWithSettings() {
+    if (process.platform !== 'win32' || !app.isPackaged) return;
+    await enableAutostart();
 }
 
 // ================= HÀM CHẠY LỆNH CMD (KHÔNG DÙNG POWERSHELL) =================
@@ -230,16 +398,84 @@ async function findInstalledPrinterDriver() {
     return preferred || allDrivers[0];
 }
 
-function createWindow() {
+const ASSETS_DIR = path.join(__dirname, 'assets');
+const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // tự kiểm tra cập nhật mỗi 4 giờ
+
+function createWindow({ startHidden = false } = {}) {
     mainWindow = new BrowserWindow({
         width: 700,
-        height: 600,
+        height: 820,
+        show: false,
+        title: 'LAN Print',
+        icon: path.join(ASSETS_DIR, 'logo.png'),
+        autoHideMenuBar: true,
         webPreferences: {
             nodeIntegration: true,
             contextIsolation: false
         }
     });
     mainWindow.loadFile('index.html');
+
+    mainWindow.once('ready-to-show', () => {
+        // Mở cùng Windows / sau khi tự cập nhật: chạy ẩn dưới khay hệ thống.
+        if (!startHidden) mainWindow.show();
+    });
+
+    // Nhấn X -> KHÔNG thoát, chỉ ẩn xuống khay (Server vẫn tiếp tục nhận lệnh in).
+    // Chỉ thoát thật khi người dùng chọn "Thoát ứng dụng".
+    mainWindow.on('close', (event) => {
+        if (app.isQuitting) return;
+        event.preventDefault();
+        mainWindow.hide();
+        if (!trayHintShown && tray && process.platform === 'win32') {
+            trayHintShown = true;
+            tray.displayBalloon({
+                iconType: 'info',
+                title: 'LAN Print vẫn đang chạy',
+                content: 'Ứng dụng đã thu nhỏ xuống khay hệ thống. Nhấp chuột phải vào biểu tượng để mở lại hoặc thoát.'
+            });
+        }
+    });
+}
+
+function showMainWindow() {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+}
+
+function quitApplication() {
+    app.isQuitting = true;
+    app.quit();
+}
+
+function trayTooltip() {
+    const { mode } = loadSettings();
+    const modeText = mode === 'server' ? 'Máy Server' : mode === 'client' ? 'Máy Client' : 'Chưa chọn chế độ';
+    return `LAN Print v${app.getVersion()} - ${modeText}`;
+}
+
+function refreshTray() {
+    if (tray) tray.setToolTip(trayTooltip());
+}
+
+function createTray() {
+    let icon = nativeImage.createFromPath(path.join(ASSETS_DIR, 'tray.png'));
+    const icon2x = nativeImage.createFromPath(path.join(ASSETS_DIR, 'tray@2x.png'));
+    if (!icon2x.isEmpty()) icon.addRepresentation({ scaleFactor: 2, buffer: icon2x.toPNG() });
+    if (icon.isEmpty()) icon = nativeImage.createFromPath(path.join(ASSETS_DIR, 'logo.png')).resize({ width: 16, height: 16 });
+
+    tray = new Tray(icon);
+    tray.setToolTip(trayTooltip());
+    tray.setContextMenu(Menu.buildFromTemplate([
+        { label: 'Mở LAN Print', click: showMainWindow },
+        { label: 'Kiểm tra cập nhật', click: () => { showMainWindow(); checkForApplicationUpdates(true); } },
+        { type: 'separator' },
+        { label: 'Thoát ứng dụng', click: quitApplication }
+    ]));
+    tray.on('click', showMainWindow);
+    tray.on('double-click', showMainWindow);
 }
 
 // Lấy toàn bộ IPv4 LAN đang hoạt động để máy Client biết IP cần kết nối.
@@ -327,6 +563,8 @@ function listenVirtualPrinterServer() {
 
         const server = net.createServer((socket) => {
         sendLog(`Nhận kết nối in từ máy: ${socket.remoteAddress}`);
+        activePrintConnections++;
+        socket.once('close', () => { activePrintConnections = Math.max(0, activePrintConnections - 1); });
 
         let fileChunks = [];
 
@@ -415,7 +653,19 @@ function stopVirtualPrinterServer(showLog = true) {
 
 ipcMain.handle('get-local-ip-addresses', () => getLocalIPv4Addresses());
 
+ipcMain.handle('get-settings', async () => ({
+    ...loadSettings(),
+    launchedAtStartup: LAUNCHED_AT_STARTUP
+}));
+
+ipcMain.on('log-from-renderer', (event, text) => sendLog(String(text)));
+
 ipcMain.on('set-app-mode', async (event, mode) => {
+    if (mode === 'server' || mode === 'client') {
+        saveSettings({ mode });
+        refreshTray();
+    }
+
     if (mode === 'server') {
         await startVirtualPrinterServer();
         const ips = getLocalIPv4Addresses();
@@ -561,6 +811,7 @@ ipcMain.on('install-virtual-printer', async (event, serverIp) => {
             return;
         }
         sendLog('Đã đặt máy in mặc định thành công!');
+        saveSettings({ mode: 'client', serverIp });
 
         sendLog('🎉 Hoàn tất! Máy in ảo đã được cài đặt và thiết lập mặc định thành công (không cần PowerShell).');
     } catch (err) {
@@ -594,6 +845,42 @@ function checkForApplicationUpdates(manual = false) {
     });
 }
 
+// Cài bản cập nhật NGẦM (không hiện trình cài đặt, không hỏi) rồi tự mở lại
+// ứng dụng. Nếu đang có lệnh in truyền tới thì chờ in xong mới cài.
+function installDownloadedUpdate(version, attempt = 0) {
+    if (activePrintConnections > 0 && attempt < 60) {
+        if (attempt === 0) sendUpdateStatus('ready', `Đã tải xong v${version}. Đang chờ lệnh in hiện tại hoàn tất rồi mới cài đặt...`);
+        setTimeout(() => installDownloadedUpdate(version, attempt + 1), 5000);
+        return;
+    }
+
+    // Đang chạy ẩn dưới khay thì mở lại cũng ẩn dưới khay, không bật cửa sổ lên.
+    const wasHidden = !mainWindow || !mainWindow.isVisible();
+    saveSettings({ startHiddenOnce: wasHidden });
+
+    sendUpdateStatus('installing', `Đang cài đặt v${version} và khởi động lại ứng dụng...`);
+    if (tray && process.platform === 'win32') {
+        tray.displayBalloon({
+            iconType: 'info',
+            title: 'LAN Print đang cập nhật',
+            content: `Đang cài phiên bản v${version}. Ứng dụng sẽ tự mở lại sau vài giây.`
+        });
+    }
+
+    setTimeout(() => {
+        app.isQuitting = true;
+        const stopServer = Promise.race([
+            stopVirtualPrinterServer(false),
+            new Promise(resolve => setTimeout(resolve, 3000))
+        ]);
+        stopServer.finally(() => {
+            // isSilent = true  : cài ngầm (NSIS /S), không hiện trình cài đặt
+            // isForceRunAfter = true : cài xong tự chạy lại ứng dụng
+            autoUpdater.quitAndInstall(true, true);
+        });
+    }, 3000);
+}
+
 function setupAutoUpdater() {
     if (autoUpdaterInitialized || !app.isPackaged) return;
     autoUpdaterInitialized = true;
@@ -616,39 +903,59 @@ function setupAutoUpdater() {
     autoUpdater.on('error', err => {
         sendUpdateStatus('error', `Lỗi Auto Update: ${err.message}`);
     });
-    autoUpdater.on('update-downloaded', async info => {
-        sendUpdateStatus('ready', `Đã tải xong phiên bản v${info.version}.`);
-        const result = await dialog.showMessageBox(mainWindow, {
-            type: 'info',
-            title: 'LAN Print - Cập nhật sẵn sàng',
-            message: `Phiên bản v${info.version} đã tải xong.`,
-            detail: 'Khởi động lại ứng dụng để cài đặt bản cập nhật ngay bây giờ?',
-            buttons: ['Khởi động lại và cập nhật', 'Để sau'],
-            defaultId: 0,
-            cancelId: 1,
-            noLink: true
-        });
-        if (result.response === 0) {
-            app.isQuitting = true;
-            autoUpdater.quitAndInstall(false, true);
-        }
+    autoUpdater.on('update-downloaded', info => {
+        sendUpdateStatus('ready', `Đã tải xong phiên bản v${info.version}. Tự động cài đặt...`);
+        installDownloadedUpdate(info.version);
     });
 
-    setTimeout(() => checkForApplicationUpdates(false), 3000);
+    setTimeout(() => checkForApplicationUpdates(false), 5000);
+    updateCheckTimer = setInterval(() => checkForApplicationUpdates(false), UPDATE_CHECK_INTERVAL_MS);
 }
 
 ipcMain.handle('get-app-version', () => app.getVersion());
 ipcMain.on('check-for-updates', () => checkForApplicationUpdates(true));
+ipcMain.on('hide-to-tray', () => { if (mainWindow) mainWindow.hide(); });
 
 app.whenReady().then(() => {
     relaunchAsAdministrator().then((alreadyElevated) => {
         if (!alreadyElevated) return;
-        createWindow();
+
+        // Chỉ cho chạy 1 bản duy nhất: khi đã tự mở cùng Windows mà người
+        // dùng bấm icon lần nữa, bản thứ 2 sẽ không tranh cổng 9100 (bản
+        // mới còn có thể "taskkill" nhầm bản cũ) mà chỉ đưa cửa sổ cũ lên.
+        if (!app.requestSingleInstanceLock()) {
+            app.isQuitting = true;
+            app.quit();
+            return;
+        }
+        app.on('second-instance', showMainWindow);
+
+        // Chạy ẩn dưới khay khi: tự khởi động cùng Windows, hoặc vừa tự cập
+        // nhật xong trong lúc ứng dụng đang ẩn.
+        const { startHiddenOnce } = loadSettings();
+        if (startHiddenOnce) saveSettings({ startHiddenOnce: false });
+        const startHidden = LAUNCHED_AT_STARTUP || !!startHiddenOnce;
+
+        createTray();
+        createWindow({ startHidden });
         setupAutoUpdater();
+        syncAutostartWithSettings().catch(err => sendLog(`⚠️ Lỗi đồng bộ khởi động cùng Windows: ${err.message}`));
     });
 });
 
+app.on('before-quit', () => {
+    app.isQuitting = true;
+    if (updateCheckTimer) clearInterval(updateCheckTimer);
+});
+
+// Ẩn cửa sổ không làm thoát ứng dụng - chỉ thoát khi người dùng chọn
+// "Thoát ứng dụng" trong menu chuột phải của biểu tượng dưới khay hệ thống.
 app.on('window-all-closed', () => {
+    if (!app.isQuitting) return;
     if (tcpPrinterServer) tcpPrinterServer.close();
     if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('will-quit', () => {
+    if (tray) { tray.destroy(); tray = null; }
 });
