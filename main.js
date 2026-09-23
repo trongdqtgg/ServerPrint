@@ -21,8 +21,20 @@ let tcpPrinterServer = null;
 let elevationRequested = false;
 let autoUpdaterInitialized = false;
 
-const VIRTUAL_PRINT_DIR = path.join(__dirname, 'virtual-print-output');
-if (!fs.existsSync(VIRTUAL_PRINT_DIR)) fs.mkdirSync(VIRTUAL_PRINT_DIR);
+// KHÔNG được dùng __dirname để ghi file: khi đóng gói bằng electron-builder,
+// __dirname trỏ vào bên trong "resources\app.asar" - đây là 1 FILE lưu trữ chỉ
+// đọc chứ không phải thư mục thật, nên fs.mkdirSync/writeFileSync vào đó sẽ
+// văng lỗi "ENOTDIR: not a directory" ngay khi khởi động trên máy người dùng.
+// Dùng thư mục dữ liệu riêng của ứng dụng (%APPDATA%\LAN Print\...) - luôn
+// ghi được, không phụ thuộc thư mục cài đặt (kể cả Program Files).
+let VIRTUAL_PRINT_DIR = null;
+function getVirtualPrintDir() {
+    if (!VIRTUAL_PRINT_DIR) {
+        VIRTUAL_PRINT_DIR = path.join(app.getPath('userData'), 'virtual-print-output');
+    }
+    fs.mkdirSync(VIRTUAL_PRINT_DIR, { recursive: true });
+    return VIRTUAL_PRINT_DIR;
+}
 
 // ================= HÀM CHẠY LỆNH CMD (KHÔNG DÙNG POWERSHELL) =================
 // Luôn resolve (không bao giờ reject) để logic gọi tiếp có thể tự quyết định
@@ -328,9 +340,14 @@ function listenVirtualPrinterServer() {
             if (buffer.length > 0) {
                 const timestamp = Date.now();
                 const outputFileName = `print_job_${timestamp}.prn`;
-                const outputPath = path.join(VIRTUAL_PRINT_DIR, outputFileName);
-
-                fs.writeFileSync(outputPath, buffer);
+                let outputPath;
+                try {
+                    outputPath = path.join(getVirtualPrintDir(), outputFileName);
+                    fs.writeFileSync(outputPath, buffer);
+                } catch (err) {
+                    sendLog(`❌ Không lưu được file in: ${err.message}`);
+                    return;
+                }
                 sendLog(`🔥 ĐÃ LƯU THÀNH CÔNG file in: ${outputFileName} (${buffer.length} bytes)`);
 
                 print(outputPath)
